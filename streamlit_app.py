@@ -61,7 +61,7 @@ if st.button("Generate CAD Design"):
         
         # Save the DXF document to a BytesIO object
         dxf_stream = BytesIO()
-        doc.saveas(dxf_stream, format="dxf")
+        doc.saveas(dxf_stream)
         dxf_stream.seek(0)
 
         # Provide download link for the DXF file
