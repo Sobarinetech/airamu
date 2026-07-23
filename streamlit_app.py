@@ -56,7 +56,19 @@ browserless_token = st.sidebar.text_input(
     help="Leave blank if your self-hosted instance doesn't require one."
 )
 request_timeout = st.sidebar.number_input(
-    "Request timeout (seconds)", min_value=5, max_value=300, value=60, step=5
+    "Request timeout (seconds)", min_value=5, max_value=300, value=90, step=5
+)
+
+fetch_method = st.sidebar.selectbox(
+    "Page-fetch method",
+    ["unblock (recommended)", "content"],
+    index=0,
+    help=(
+        "ibbi.baanknet.com returns HTTP 403 to plain headless requests "
+        "(WAF/bot detection fires before JS even runs). '/unblock' uses "
+        "Browserless's stealth/evasion techniques and works reliably here. "
+        "'/content' is faster but will usually get blocked on this site."
+    ),
 )
 
 st.sidebar.divider()
@@ -103,19 +115,84 @@ def call_browserless(path: str, payload: dict):
     return ok, resp.status_code, body, content_type
 
 
-def fetch_rendered_html(url: str, wait_selector: str | None = None):
-    """Use /content to get fully rendered HTML for a given URL."""
-    payload = {"url": url, "gotoOptions": {"waitUntil": "networkidle2"}}
+def _looks_blocked(html: str) -> bool:
+    """Heuristic: does this look like a WAF/error page rather than real content?"""
+    if not html or len(html.strip()) < 500:
+        return True
+    lowered = html.lower()
+    markers = ["403 forbidden", "access denied", "request blocked", "attention required"]
+    return any(m in lowered for m in markers) and "asset-listing-content" not in lowered
+
+
+def fetch_via_content(url: str, wait_selector: str | None):
+    """Use /content — fast, but ibbi.baanknet.com usually 403s plain headless requests."""
+    payload = {
+        "url": url,
+        "gotoOptions": {"waitUntil": "networkidle2", "timeout": 45000},
+        # bestAttempt: still return whatever HTML we got even if the
+        # waitForSelector below times out, instead of a hard 500.
+        "bestAttempt": True,
+    }
     if wait_selector:
-        payload["waitForSelector"] = {"selector": wait_selector, "timeout": 15000}
+        payload["waitForSelector"] = {"selector": wait_selector, "timeout": 20000}
     ok, status, body, ctype = call_browserless("content", payload)
     if not ok:
-        return None, f"HTTP {status}: {body}"
+        return None, f"/content failed — HTTP {status}: {body}"
+    html = body.get("data") if isinstance(body, dict) else body
+    if html is None:
+        html = json.dumps(body)
+    return html, None
+
+
+def fetch_via_unblock(url: str, wait_selector: str | None):
+    """Use /unblock — Browserless's stealth/evasion endpoint. Needed for ibbi.baanknet.com."""
+    payload = {
+        "url": url,
+        "content": True,
+        "cookies": False,
+        "screenshot": False,
+        "browserWSEndpoint": False,
+        "gotoOptions": {"waitUntil": "networkidle2", "timeout": 45000},
+    }
+    if wait_selector:
+        payload["waitForSelector"] = {"selector": wait_selector, "timeout": 20000}
+    ok, status, body, ctype = call_browserless("unblock", payload)
+    if not ok:
+        return None, f"/unblock failed — HTTP {status}: {body}"
     if isinstance(body, dict):
-        # some browserless configs wrap html in JSON
-        html = body.get("data") or body.get("html") or json.dumps(body)
-    else:
-        html = body
+        html = body.get("content") or body.get("data") or body.get("html")
+        if html is None:
+            return None, f"/unblock succeeded but returned no content field. Raw: {json.dumps(body)[:500]}"
+        return html, None
+    return body, None
+
+
+def fetch_rendered_html(url: str, wait_selector: str | None = None, method: str | None = None):
+    """Fetch fully rendered HTML for a URL, routing through the selected method.
+
+    Falls back gracefully: if the primary method returns a blocked/empty page,
+    tries the other method once before giving up.
+    """
+    method = method or fetch_method
+    primary = fetch_via_unblock if method.startswith("unblock") else fetch_via_content
+    fallback = fetch_via_content if method.startswith("unblock") else fetch_via_unblock
+
+    html, err = primary(url, wait_selector)
+    if err:
+        html2, err2 = fallback(url, wait_selector)
+        if err2:
+            return None, f"Primary method failed ({err}); fallback also failed ({err2})"
+        if _looks_blocked(html2):
+            return html2, f"Both methods returned what looks like a blocked/empty page. Last error: {err}"
+        return html2, None
+
+    if _looks_blocked(html):
+        html2, err2 = fallback(url, wait_selector)
+        if not err2 and html2 and not _looks_blocked(html2):
+            return html2, None
+        return html, ("Warning: response looks like a WAF/blocked page (403 or near-empty). "
+                       "Try the other fetch method in the sidebar, or increase the timeout.")
+
     return html, None
 
 
@@ -220,14 +297,27 @@ with tab_raw:
     with col1:
         endpoint_choice = st.selectbox(
             "Endpoint",
-            ["content", "scrape", "smart-scrape", "screenshot", "function"],
+            ["unblock", "content", "scrape", "smart-scrape", "screenshot", "function"],
             index=0,
+            help="ibbi.baanknet.com 403s plain /content requests — start with /unblock.",
         )
     with col2:
         target_url = st.text_input("Target URL", value=IBBI_HOME)
 
     default_payloads = {
-        "content": {"url": target_url, "gotoOptions": {"waitUntil": "networkidle2"}},
+        "unblock": {
+            "url": target_url,
+            "content": True,
+            "cookies": False,
+            "screenshot": False,
+            "browserWSEndpoint": False,
+            "gotoOptions": {"waitUntil": "networkidle2", "timeout": 45000},
+        },
+        "content": {
+            "url": target_url,
+            "gotoOptions": {"waitUntil": "networkidle2", "timeout": 45000},
+            "bestAttempt": True,
+        },
         "scrape": {
             "url": target_url,
             "elements": [{"selector": ".asset-listing-content"}],
@@ -276,15 +366,24 @@ with tab_listings:
     home_url = st.text_input("Home page URL", value=IBBI_HOME, key="home_url")
 
     if st.button("Fetch listings", type="primary"):
-        with st.spinner("Rendering page via Browserless /content ..."):
+        with st.spinner(f"Rendering page via Browserless ({fetch_method.split()[0]}) ..."):
             html, err = fetch_rendered_html(home_url, wait_selector=".asset-listing-content")
-        if err:
+        if html is None:
             st.error(err)
         else:
+            if err:
+                st.warning(err)
             st.session_state.last_raw_html = html
             listings = parse_listings(html, home_url)
             st.session_state.listings = listings
-            st.success(f"Parsed {len(listings)} listing(s).")
+            if listings:
+                st.success(f"Parsed {len(listings)} listing(s).")
+            else:
+                st.warning(
+                    "0 listings parsed. The page HTML was fetched but no "
+                    "`.asset-listing-content` blocks were found — check the "
+                    "raw HTML below to see what actually came back."
+                )
 
     if st.session_state.listings:
         df = pd.DataFrame(st.session_state.listings)
@@ -331,9 +430,11 @@ with tab_detail:
         else:
             with st.spinner("Rendering asset detail page ..."):
                 html, err = fetch_rendered_html(detail_url)
-            if err:
+            if html is None:
                 st.error(err)
             else:
+                if err:
+                    st.warning(err)
                 st.session_state.last_raw_html = html
                 docs = extract_document_links(html, detail_url)
                 if docs:
@@ -405,9 +506,11 @@ with tab_pipeline:
         if refresh_first or not st.session_state.listings:
             with st.spinner("Fetching & parsing home page ..."):
                 html, err = fetch_rendered_html(pipeline_home_url, wait_selector=".asset-listing-content")
-            if err:
+            if html is None:
                 st.error(err)
                 st.stop()
+            if err:
+                st.warning(err)
             st.session_state.listings = parse_listings(html, pipeline_home_url)
 
         listings = st.session_state.listings
@@ -436,10 +539,12 @@ with tab_pipeline:
                 continue
 
             html, err = fetch_rendered_html(detail_url)
-            if err:
+            if html is None:
                 row["error"] = f"detail fetch failed: {err}"
                 results.append(row)
                 continue
+            if err:
+                row["error"] = f"warning: {err}"
 
             docs = extract_document_links(html, detail_url)
             if not docs:
