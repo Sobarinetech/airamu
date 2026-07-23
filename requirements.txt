@@ -1,6 +1,4 @@
 streamlit
-google-generativeai 
-ezdxf 
-matplotlib
-trimesh
-transformers
+requests
+beautifulsoup4
+pandas
