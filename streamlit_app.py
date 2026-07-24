@@ -61,14 +61,29 @@ request_timeout = st.sidebar.number_input(
 
 fetch_method = st.sidebar.selectbox(
     "Page-fetch method",
-    ["unblock (recommended)", "content"],
-    index=0,
+    ["content (spoofed headers)", "function (stealth script)"],
+    index=1,
     help=(
-        "ibbi.baanknet.com returns HTTP 403 to plain headless requests "
-        "(WAF/bot detection fires before JS even runs). '/unblock' uses "
-        "Browserless's stealth/evasion techniques and works reliably here. "
-        "'/content' is faster but will usually get blocked on this site."
+        "This self-hosted Browserless build does NOT register /unblock, "
+        "/smart-scrape, /search, /map, or /crawl (those are cloud/paid-tier "
+        "routes) — only /content, /scrape, /screenshot, /pdf, /function, "
+        "/download are available. ibbi.baanknet.com 403s the very first "
+        "request (even favicon.ico), which looks like an IP/WAF-level block "
+        "on the VPS's datacenter IP rather than pure JS fingerprinting. "
+        "'/function' lets us spoof UA/headers and strip navigator.webdriver "
+        "before navigating, which is the best shot available on this build."
     ),
+)
+
+custom_user_agent = st.sidebar.text_input(
+    "Spoofed User-Agent",
+    value=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+)
+custom_accept_language = st.sidebar.text_input(
+    "Accept-Language header", value="en-IN,en-US;q=0.9,en;q=0.8"
 )
 
 st.sidebar.divider()
@@ -125,10 +140,16 @@ def _looks_blocked(html: str) -> bool:
 
 
 def fetch_via_content(url: str, wait_selector: str | None):
-    """Use /content — fast, but ibbi.baanknet.com usually 403s plain headless requests."""
+    """Use /content — spoofs a normal browser UA/headers. May still be IP-blocked."""
     payload = {
         "url": url,
         "gotoOptions": {"waitUntil": "networkidle2", "timeout": 45000},
+        "setJavaScriptEnabled": True,
+        "userAgent": custom_user_agent,
+        "setExtraHTTPHeaders": {
+            "Accept-Language": custom_accept_language,
+            "Upgrade-Insecure-Requests": "1",
+        },
         # bestAttempt: still return whatever HTML we got even if the
         # waitForSelector below times out, instead of a hard 500.
         "bestAttempt": True,
@@ -144,27 +165,79 @@ def fetch_via_content(url: str, wait_selector: str | None):
     return html, None
 
 
-def fetch_via_unblock(url: str, wait_selector: str | None):
-    """Use /unblock — Browserless's stealth/evasion endpoint. Needed for ibbi.baanknet.com."""
-    payload = {
-        "url": url,
-        "content": True,
-        "cookies": False,
-        "screenshot": False,
-        "browserWSEndpoint": False,
-        "gotoOptions": {"waitUntil": "networkidle2", "timeout": 45000},
+_FUNCTION_STEALTH_TEMPLATE = r"""
+export default async ({ page, context }) => {
+  const { url, userAgent, acceptLanguage, waitSelector } = context;
+
+  // Basic fingerprint cleanup before anything loads
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+    window.chrome = { runtime: {} };
+  });
+
+  await page.setUserAgent(userAgent);
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': acceptLanguage,
+    'Upgrade-Insecure-Requests': '1',
+  });
+  await page.setViewport({ width: 1366, height: 900 });
+
+  let status = null;
+  try {
+    const resp = await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
+    status = resp ? resp.status() : null;
+  } catch (e) {
+    // fall through — we still try to grab whatever content is there
+  }
+
+  if (waitSelector) {
+    try {
+      await page.waitForSelector(waitSelector, { timeout: 20000 });
+    } catch (e) {
+      // ignore — bestAttempt behavior, return what we have
     }
-    if wait_selector:
-        payload["waitForSelector"] = {"selector": wait_selector, "timeout": 20000}
-    ok, status, body, ctype = call_browserless("unblock", payload)
+  }
+
+  const html = await page.content();
+  return { data: JSON.stringify({ html, status }), type: 'application/json' };
+};
+"""
+
+
+def fetch_via_function(url: str, wait_selector: str | None):
+    """Use /function — the only route on this build that lets us spoof UA/headers
+    and strip navigator.webdriver before navigating."""
+    payload = {
+        "code": _FUNCTION_STEALTH_TEMPLATE,
+        "context": {
+            "url": url,
+            "userAgent": custom_user_agent,
+            "acceptLanguage": custom_accept_language,
+            "waitSelector": wait_selector or None,
+        },
+    }
+    ok, status, body, ctype = call_browserless("function", payload)
     if not ok:
-        return None, f"/unblock failed — HTTP {status}: {body}"
-    if isinstance(body, dict):
-        html = body.get("content") or body.get("data") or body.get("html")
-        if html is None:
-            return None, f"/unblock succeeded but returned no content field. Raw: {json.dumps(body)[:500]}"
+        return None, f"/function failed — HTTP {status}: {body}"
+
+    # body may already be parsed JSON, or a raw string containing JSON
+    parsed = body
+    if isinstance(body, str):
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            return body, None  # not JSON — treat as raw html fallback
+
+    if isinstance(parsed, dict) and "html" in parsed:
+        html = parsed["html"]
+        page_status = parsed.get("status")
+        if page_status and page_status >= 400:
+            return html, f"Target page responded with HTTP {page_status} inside the browser."
         return html, None
-    return body, None
+
+    return json.dumps(parsed), None
 
 
 def fetch_rendered_html(url: str, wait_selector: str | None = None, method: str | None = None):
@@ -174,8 +247,8 @@ def fetch_rendered_html(url: str, wait_selector: str | None = None, method: str 
     tries the other method once before giving up.
     """
     method = method or fetch_method
-    primary = fetch_via_unblock if method.startswith("unblock") else fetch_via_content
-    fallback = fetch_via_content if method.startswith("unblock") else fetch_via_unblock
+    primary = fetch_via_function if method.startswith("function") else fetch_via_content
+    fallback = fetch_via_content if method.startswith("function") else fetch_via_function
 
     html, err = primary(url, wait_selector)
     if err:
@@ -297,42 +370,48 @@ with tab_raw:
     with col1:
         endpoint_choice = st.selectbox(
             "Endpoint",
-            ["unblock", "content", "scrape", "smart-scrape", "screenshot", "function"],
+            ["function", "content", "scrape", "screenshot", "pdf", "download"],
             index=0,
-            help="ibbi.baanknet.com 403s plain /content requests — start with /unblock.",
+            help=(
+                "Only these routes are registered on your self-hosted instance "
+                "(per its boot log) — no /unblock, /smart-scrape, /search, "
+                "/map, or /crawl. ibbi.baanknet.com 403s plain /content — "
+                "/function (with UA/header spoofing) is the best shot here."
+            ),
         )
     with col2:
         target_url = st.text_input("Target URL", value=IBBI_HOME)
 
     default_payloads = {
-        "unblock": {
-            "url": target_url,
-            "content": True,
-            "cookies": False,
-            "screenshot": False,
-            "browserWSEndpoint": False,
-            "gotoOptions": {"waitUntil": "networkidle2", "timeout": 45000},
-        },
         "content": {
             "url": target_url,
             "gotoOptions": {"waitUntil": "networkidle2", "timeout": 45000},
+            "userAgent": custom_user_agent,
+            "setExtraHTTPHeaders": {"Accept-Language": custom_accept_language},
             "bestAttempt": True,
         },
         "scrape": {
             "url": target_url,
             "elements": [{"selector": ".asset-listing-content"}],
         },
-        "smart-scrape": {"url": target_url, "format": ["html", "markdown"]},
         "screenshot": {"url": target_url, "options": {"fullPage": True}},
-        "function": {
+        "pdf": {"url": target_url},
+        "download": {
             "code": (
                 "export default async ({ page }) => {\n"
                 "  await page.goto(context.url, { waitUntil: 'networkidle2' });\n"
-                "  const html = await page.content();\n"
-                "  return { data: html, type: 'text/html' };\n"
                 "};"
             ),
             "context": {"url": target_url},
+        },
+        "function": {
+            "code": _FUNCTION_STEALTH_TEMPLATE.strip(),
+            "context": {
+                "url": target_url,
+                "userAgent": custom_user_agent,
+                "acceptLanguage": custom_accept_language,
+                "waitSelector": ".asset-listing-content",
+            },
         },
     }
 
