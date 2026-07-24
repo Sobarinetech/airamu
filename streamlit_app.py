@@ -86,6 +86,20 @@ custom_accept_language = st.sidebar.text_input(
     "Accept-Language header", value="en-IN,en-US;q=0.9,en;q=0.8"
 )
 
+proxy_server = st.sidebar.text_input(
+    "Proxy server (optional)",
+    value="",
+    placeholder="http://user:pass@host:port",
+    help=(
+        "ibbi.baanknet.com appears to block this VPS's IP outright — no "
+        "amount of header/UA spoofing fixes an IP-level block. If you have "
+        "a residential/rotating proxy, set it here and Browserless will "
+        "launch Chromium through it. Leave blank to keep using the VPS's "
+        "direct connection (will likely stay blocked — use Diagnostics to "
+        "confirm)."
+    ),
+)
+
 st.sidebar.divider()
 pdf_extract_url = st.sidebar.text_input(
     "PDF extraction endpoint", value=DEFAULT_PDF_EXTRACT_URL
@@ -139,6 +153,18 @@ def _looks_blocked(html: str) -> bool:
     return any(m in lowered for m in markers) and "asset-listing-content" not in lowered
 
 
+def _launch_options():
+    """Shared launchOptions payload fragment — adds a proxy server if configured."""
+    if not proxy_server:
+        return {}
+    # Strip credentials for --proxy-server (Chromium doesn't accept user:pass in
+    # the flag itself); auth is handled separately per-endpoint where possible.
+    from urllib.parse import urlparse
+    parsed = urlparse(proxy_server if "://" in proxy_server else f"http://{proxy_server}")
+    server = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}" if parsed.hostname else proxy_server
+    return {"launchOptions": {"args": [f"--proxy-server={server}"]}}
+
+
 def fetch_via_content(url: str, wait_selector: str | None):
     """Use /content — spoofs a normal browser UA/headers. May still be IP-blocked."""
     payload = {
@@ -153,6 +179,7 @@ def fetch_via_content(url: str, wait_selector: str | None):
         # bestAttempt: still return whatever HTML we got even if the
         # waitForSelector below times out, instead of a hard 500.
         "bestAttempt": True,
+        **_launch_options(),
     }
     if wait_selector:
         payload["waitForSelector"] = {"selector": wait_selector, "timeout": 20000}
@@ -167,7 +194,11 @@ def fetch_via_content(url: str, wait_selector: str | None):
 
 _FUNCTION_STEALTH_TEMPLATE = r"""
 export default async ({ page, context }) => {
-  const { url, userAgent, acceptLanguage, waitSelector } = context;
+  const { url, userAgent, acceptLanguage, waitSelector, proxyUsername, proxyPassword } = context;
+
+  if (proxyUsername) {
+    await page.authenticate({ username: proxyUsername, password: proxyPassword || '' });
+  }
 
   // Basic fingerprint cleanup before anything loads
   await page.evaluateOnNewDocument(() => {
@@ -209,6 +240,12 @@ export default async ({ page, context }) => {
 def fetch_via_function(url: str, wait_selector: str | None):
     """Use /function — the only route on this build that lets us spoof UA/headers
     and strip navigator.webdriver before navigating."""
+    proxy_user, proxy_pass = None, None
+    if proxy_server and "@" in proxy_server:
+        from urllib.parse import urlparse
+        p = urlparse(proxy_server if "://" in proxy_server else f"http://{proxy_server}")
+        proxy_user, proxy_pass = p.username, p.password
+
     payload = {
         "code": _FUNCTION_STEALTH_TEMPLATE,
         "context": {
@@ -216,7 +253,10 @@ def fetch_via_function(url: str, wait_selector: str | None):
             "userAgent": custom_user_agent,
             "acceptLanguage": custom_accept_language,
             "waitSelector": wait_selector or None,
+            "proxyUsername": proxy_user,
+            "proxyPassword": proxy_pass,
         },
+        **_launch_options(),
     }
     ok, status, body, ctype = call_browserless("function", payload)
     if not ok:
@@ -359,9 +399,90 @@ st.caption(
     "Browserless REST API, and pipe discovered documents to your PDF extractor."
 )
 
-tab_raw, tab_listings, tab_detail, tab_pdf, tab_pipeline = st.tabs(
-    ["🔧 Raw request tester", "📋 Auction listings", "📄 Asset detail", "🧾 PDF extractor", "🚀 Full pipeline"]
+tab_diag, tab_raw, tab_listings, tab_detail, tab_pdf, tab_pipeline = st.tabs(
+    ["🩺 Diagnostics", "🔧 Raw request tester", "📋 Auction listings", "📄 Asset detail", "🧾 PDF extractor", "🚀 Full pipeline"]
 )
+
+# ---- Tab 0: Diagnostics ----------------------------------------------------
+with tab_diag:
+    st.subheader("Is this an IP block or a fingerprint block?")
+    st.caption(
+        "ibbi.baanknet.com 403s the very first request from this Browserless "
+        "instance — even favicon.ico, before any JS runs. That pattern points "
+        "to an IP/WAF-level block on the VPS's egress IP. These two checks "
+        "confirm it."
+    )
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown("**1. What IP does Browserless actually egress from?**")
+        if st.button("Check Browserless's outbound IP"):
+            ip_check_code = (
+                "export default async ({ page, context }) => {\n"
+                "  if (context.proxyUsername) {\n"
+                "    await page.authenticate({ username: context.proxyUsername, password: context.proxyPassword || '' });\n"
+                "  }\n"
+                "  const resp = await page.goto('https://api.ipify.org?format=json', { waitUntil: 'networkidle2', timeout: 20000 });\n"
+                "  const text = await resp.text();\n"
+                "  return { data: text, type: 'application/json' };\n"
+                "};"
+            )
+            proxy_user, proxy_pass = None, None
+            if proxy_server and "@" in proxy_server:
+                from urllib.parse import urlparse
+                p = urlparse(proxy_server if "://" in proxy_server else f"http://{proxy_server}")
+                proxy_user, proxy_pass = p.username, p.password
+            payload = {
+                "code": ip_check_code,
+                "context": {"proxyUsername": proxy_user, "proxyPassword": proxy_pass},
+                **_launch_options(),
+            }
+            with st.spinner("Asking Browserless to report its outbound IP ..."):
+                ok, status, body, ctype = call_browserless("function", payload)
+            if ok:
+                st.success("Browserless is egressing from:")
+                st.json(body if isinstance(body, dict) else json.loads(body))
+                st.caption(
+                    "Compare this to your VPS's known public IP "
+                    f"(from the sidebar URL: {browserless_url}). If they match "
+                    "and no proxy is set, that IP is what IBBI's WAF sees."
+                )
+            else:
+                st.error(f"HTTP {status}: {body}")
+
+    with col_b:
+        st.markdown("**2. Plain HTTP request (no browser) from wherever this app runs**")
+        diag_url = st.text_input("URL to test", value=IBBI_HOME, key="diag_url")
+        if st.button("Send plain requests.get()"):
+            try:
+                headers = {
+                    "User-Agent": custom_user_agent,
+                    "Accept-Language": custom_accept_language,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                }
+                resp = requests.get(diag_url, headers=headers, timeout=request_timeout, allow_redirects=True)
+                st.write(f"**Status:** {resp.status_code}")
+                st.write(f"**Server header:** {resp.headers.get('server', 'n/a')}")
+                with st.expander("Response headers"):
+                    st.json(dict(resp.headers))
+                with st.expander("First 2000 chars of body"):
+                    st.code(resp.text[:2000])
+            except requests.exceptions.RequestException as e:
+                st.error(str(e))
+        st.caption(
+            "This request comes from wherever Streamlit itself is hosted "
+            "(not the Browserless VPS), so a different result here vs. the "
+            "Browserless calls tells you the block is specific to the VPS IP."
+        )
+
+    st.divider()
+    st.markdown(
+        "**If both checks confirm an IP-level block:** header/UA/fingerprint "
+        "spoofing won't help — you'd need to route Browserless traffic "
+        "through a residential/rotating proxy (set one in the sidebar) or "
+        "run Browserless from a non-datacenter network."
+    )
 
 # ---- Tab 1: Raw request tester -------------------------------------------
 with tab_raw:
