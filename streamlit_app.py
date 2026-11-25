@@ -152,15 +152,32 @@ with tab_embed:
         with st.spinner("Embedding…"):
             status, body = call_api(RAG_URL, {"mode": "embed", "inputs": text}, "embed")
         if status == 200 and body.get("success"):
-            vec = body["embedding"]
-            st.success(f"dimension = {body.get('dimension')} · returned {len(vec)} floats")
-            st.write("First 8 values:", [round(v, 5) for v in vec[:8]])
-            st.line_chart(vec, height=160)
-            st.download_button("Download embedding JSON", json.dumps(vec), "embedding.json", "application/json")
-            with st.expander("Full response"):
-                st.json(body)
+            st.session_state.embed_result = {"input": text, **body}
         else:
+            st.session_state.pop("embed_result", None)
             show_error(status, body)
+
+    res = st.session_state.get("embed_result")
+    if res:
+        vec = res["embedding"]
+        st.success(f"dimension = {res.get('dimension')} · returned {len(vec)} floats")
+        st.write("First 8 values:", [round(v, 5) for v in vec[:8]])
+        st.line_chart(vec, height=160)
+        d1, d2 = st.columns(2)
+        d1.download_button(
+            "⬇ Download embedding (JSON object)",
+            json.dumps(res, indent=2),
+            "embedding.json",
+            "application/json",
+            help='{"input": ..., "success": true, "dimension": 768, "embedding": [...]}',
+        )
+        d2.download_button(
+            "⬇ Download raw vector (array only)",
+            json.dumps(vec),
+            "embedding_vector.json",
+            "application/json",
+            help="Flat array of 768 floats — paste straight into the Vector search tab.",
+        )
 
 # ------------------------------------------------------------------ UPSERT
 with tab_upsert:
@@ -219,6 +236,20 @@ with tab_upsert:
                 use_container_width=True,
                 hide_index=True,
             )
+
+        # Chunks in the same shape the "Raw JSON chunks" input and the API expect
+        export = []
+        for c in chunks:
+            item = {"chunk_id": str(c.get("chunk_id", "")), "text": c["text"]}
+            if c.get("page_number") is not None:
+                item["page_number"] = c["page_number"]
+            export.append(item)
+        st.download_button(
+            "⬇ Download chunks (JSON)",
+            json.dumps(export, indent=2, ensure_ascii=False),
+            f"{(doc_id.strip() or 'chunks')}_chunks.json",
+            "application/json",
+        )
 
         auto_retry = st.checkbox("Auto-wait and retry on 429", value=True)
         if st.button("Upsert to index", type="primary", disabled=not doc_id.strip()):
